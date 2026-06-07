@@ -1,0 +1,57 @@
+name: FVE API Crate
+
+on:
+  push:
+    paths:
+      - "crates/fveapi/**"
+      - ".github/workflows/fveapi.yml"
+  pull_request:
+    paths:
+      - "crates/fveapi/**"
+      - ".github/workflows/fveapi.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fveapi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    defaults:
+      run:
+        working-directory: crates/fveapi
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/fveapi
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets -- --nocapture

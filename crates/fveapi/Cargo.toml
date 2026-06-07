@@ -1,0 +1,14 @@
+[package]
+name = "fveapi"
+version = "0.1.0"
+edition = "2021"
+authors = ["NORMAL-EX"]
+description = "Small zero-dependency Rust wrapper around Windows fveapi.dll"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "fveapi"
+path = "src/lib.rs"
+
+[dependencies]
