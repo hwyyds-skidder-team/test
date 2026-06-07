@@ -1,7 +1,8 @@
-use fveapi::{FveApi, FveApiError};
-
 #[cfg(windows)]
-use fveapi::{FveError, FVE_STATUS_LAYOUTS};
+use fveapi::{FveApi, FveError, FVE_STATUS_LAYOUTS};
+
+#[cfg(not(windows))]
+use fveapi::{FveApi, FveApiError};
 
 #[cfg(windows)]
 #[test]
