@@ -267,6 +267,7 @@ pub enum FveApiError {
     UnsupportedPlatform,
     LibraryLoadFailed(String),
     MissingExport(&'static str),
+    MemoryProtectionFailed(&'static str, String),
     Hresult(FveError),
 }
 
@@ -276,6 +277,9 @@ impl fmt::Display for FveApiError {
             Self::UnsupportedPlatform => write!(f, "fveapi.dll is only available on Windows"),
             Self::LibraryLoadFailed(message) => write!(f, "failed to load fveapi.dll: {message}"),
             Self::MissingExport(name) => write!(f, "fveapi.dll is missing export {name}"),
+            Self::MemoryProtectionFailed(operation, message) => {
+                write!(f, "{operation} failed: {message}")
+            }
             Self::Hresult(error) => write!(f, "{error}"),
         }
     }
@@ -441,7 +445,7 @@ impl FveAuthInformation {
 const _: () =
     assert!(std::mem::size_of::<FveAuthInformation>() == FVE_AUTH_INFORMATION_SIZE as usize);
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn initialized_auth_element_buffer(kind: FveAuthElementKind) -> Vec<u8> {
     let size = kind.buffer_size();
     let mut buffer = vec![0u8; size];
@@ -473,6 +477,131 @@ mod windows_api {
         fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
         fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *mut c_void;
         fn FreeLibrary(module: *mut c_void) -> i32;
+        fn VirtualAlloc(
+            lp_address: *mut c_void,
+            dw_size: usize,
+            fl_allocation_type: u32,
+            fl_protect: u32,
+        ) -> *mut c_void;
+        fn VirtualFree(lp_address: *mut c_void, dw_size: usize, dw_free_type: u32) -> i32;
+        fn VirtualLock(lp_address: *mut c_void, dw_size: usize) -> i32;
+        fn VirtualUnlock(lp_address: *mut c_void, dw_size: usize) -> i32;
+        fn VirtualProtect(
+            lp_address: *mut c_void,
+            dw_size: usize,
+            fl_new_protect: u32,
+            lpfl_old_protect: *mut u32,
+        ) -> i32;
+    }
+
+    const MEM_COMMIT: u32 = 0x0000_1000;
+    const MEM_RESERVE: u32 = 0x0000_2000;
+    const MEM_RELEASE: u32 = 0x0000_8000;
+    const PAGE_NOACCESS: u32 = 0x01;
+    const PAGE_READWRITE: u32 = 0x04;
+
+    struct ProtectedAuthElement {
+        ptr: *mut u8,
+        len: usize,
+        locked: bool,
+        noaccess: bool,
+    }
+
+    impl ProtectedAuthElement {
+        fn new(kind: FveAuthElementKind) -> Result<Self, FveApiError> {
+            let len = kind.buffer_size();
+            let ptr = unsafe {
+                VirtualAlloc(
+                    std::ptr::null_mut(),
+                    len,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            }
+            .cast::<u8>();
+
+            if ptr.is_null() {
+                return Err(FveApiError::MemoryProtectionFailed(
+                    "VirtualAlloc",
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+
+            let locked = unsafe { VirtualLock(ptr.cast::<c_void>(), len) } != 0;
+            let mut buffer = Self {
+                ptr,
+                len,
+                locked,
+                noaccess: false,
+            };
+            write_u32_at(buffer.as_mut_slice(), OFFSET_SIZE, len as u32);
+            write_u32_at(
+                buffer.as_mut_slice(),
+                OFFSET_VERSION,
+                FVE_AUTH_ELEMENT_VERSION,
+            );
+            Ok(buffer)
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut c_void {
+            self.ptr.cast::<c_void>()
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+
+        fn zero_and_protect(&mut self) {
+            if self.ptr.is_null() || self.noaccess {
+                return;
+            }
+
+            secure_zero(self.ptr, self.len);
+
+            if self.locked {
+                unsafe {
+                    VirtualUnlock(self.ptr.cast::<c_void>(), self.len);
+                }
+                self.locked = false;
+            }
+
+            let mut old_protect = 0u32;
+            if unsafe {
+                VirtualProtect(
+                    self.ptr.cast::<c_void>(),
+                    self.len,
+                    PAGE_NOACCESS,
+                    &mut old_protect,
+                )
+            } != 0
+            {
+                self.noaccess = true;
+            }
+        }
+    }
+
+    impl Drop for ProtectedAuthElement {
+        fn drop(&mut self) {
+            if self.ptr.is_null() {
+                return;
+            }
+
+            self.zero_and_protect();
+            unsafe {
+                VirtualFree(self.ptr.cast::<c_void>(), 0, MEM_RELEASE);
+            }
+            self.ptr = std::ptr::null_mut();
+            self.len = 0;
+        }
+    }
+
+    fn secure_zero(ptr: *mut u8, len: usize) {
+        for offset in 0..len {
+            unsafe {
+                std::ptr::write_volatile(ptr.add(offset), 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(super) struct DynamicLibrary {
@@ -690,29 +819,23 @@ mod windows_api {
             &self,
             kind: FveAuthElementKind,
             secret: &str,
-        ) -> Result<Vec<u8>, FveApiError> {
+        ) -> Result<ProtectedAuthElement, FveApiError> {
             let wide_secret = to_wide_null(secret);
-            let mut auth_element = initialized_auth_element_buffer(kind);
+            let mut auth_element = ProtectedAuthElement::new(kind)?;
 
             let hresult = match kind {
                 FveAuthElementKind::Passphrase => unsafe {
-                    (self.fn_auth_from_passphrase)(
-                        wide_secret.as_ptr(),
-                        auth_element.as_mut_ptr().cast::<c_void>(),
-                    )
+                    (self.fn_auth_from_passphrase)(wide_secret.as_ptr(), auth_element.as_mut_ptr())
                 },
                 FveAuthElementKind::RecoveryPassword => unsafe {
-                    (self.fn_auth_from_recovery)(
-                        wide_secret.as_ptr(),
-                        auth_element.as_mut_ptr().cast::<c_void>(),
-                    )
+                    (self.fn_auth_from_recovery)(wide_secret.as_ptr(), auth_element.as_mut_ptr())
                 },
             };
 
             if hresult == FveError::Success.code() {
                 Ok(auth_element)
             } else {
-                auth_element.fill(0);
+                auth_element.zero_and_protect();
                 Err(FveError::from_hresult(hresult).into())
             }
         }
@@ -761,11 +884,14 @@ mod windows_api {
             self.unlock_with_auth_element(auth_element)
         }
 
-        fn unlock_with_auth_element(&self, mut auth_element: Vec<u8>) -> Result<(), FveApiError> {
-            let mut element_ptrs = [auth_element.as_mut_ptr().cast::<c_void>()];
+        fn unlock_with_auth_element(
+            &self,
+            mut auth_element: ProtectedAuthElement,
+        ) -> Result<(), FveApiError> {
+            let mut element_ptrs = [auth_element.as_mut_ptr()];
             let auth_info = FveAuthInformation::new(&mut element_ptrs);
             let hresult = unsafe { (self.api.fn_unlock_volume)(self.handle, &auth_info) };
-            auth_element.fill(0);
+            auth_element.zero_and_protect();
 
             if hresult == FveError::Success.code() || hresult == FveError::VolumeUnlocked.code() {
                 Ok(())
